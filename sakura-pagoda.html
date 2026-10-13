@@ -1,0 +1,745 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Sakura Pagoda Garden — Voxel Scene</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#0b0f1e;font-family:"Segoe UI",system-ui,sans-serif;}
+  canvas{display:block;}
+  #panel{position:fixed;top:16px;left:16px;padding:14px 16px;border-radius:14px;background:rgba(255,255,255,.14);
+    backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border:1px solid rgba(255,255,255,.28);
+    color:#fff;text-shadow:0 1px 3px rgba(0,0,0,.5);max-width:300px;user-select:none;z-index:5;}
+  #panel h1{margin:0 0 4px;font-size:18px;letter-spacing:.4px;}
+  #panel p{margin:0 0 10px;font-size:12px;opacity:.9;}
+  .btns{display:flex;gap:6px;flex-wrap:wrap;}
+  button{cursor:pointer;border:0;border-radius:999px;padding:7px 12px;font-size:12px;font-weight:700;color:#4a1838;
+    background:rgba(255,214,228,.94);box-shadow:0 2px 8px rgba(0,0,0,.25);}
+  button:hover{background:#fff;}
+  #stats{margin-top:8px;font-size:11px;opacity:.8;}
+  #loading{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;
+    background:radial-gradient(circle at 50% 40%,#ffe0ec,#9fd2f2);color:#5a2346;font-size:18px;font-weight:700;z-index:10;transition:opacity .8s;}
+  #loading .flower{font-size:60px;animation:spin 2.4s linear infinite;}
+  @keyframes spin{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<div id="loading"><div class="flower">🌸</div><div>Planting cherry blossoms…</div></div>
+<div id="panel">
+  <h1>🌸 Sakura Pagoda Garden</h1>
+  <p>Drag to orbit · Scroll to zoom · Right-drag to pan<br/>Keys: <b>N</b> night · <b>R</b> rotate · <b>P</b> petals</p>
+  <div class="btns">
+    <button id="bNight">🌙 Night</button>
+    <button id="bRot">⏸ Rotate</button>
+    <button id="bPetal">🌸 Petals</button>
+  </div>
+  <div id="stats"></div>
+</div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+} }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+/* ======================= RNG & NOISE ======================= */
+let _s = 20240607;
+function rand(){ _s|=0; _s=_s+0x6D2B79F5|0; let t=Math.imul(_s^_s>>>15,1|_s); t=t+Math.imul(t^t>>>7,61|t)^t; return ((t^t>>>14)>>>0)/4294967296; }
+const rr=(a,b)=>a+rand()*(b-a);
+const ri=(a,b)=>Math.floor(a+rand()*(b-a+1));
+const pick=a=>a[Math.floor(rand()*a.length)];
+function hash2(x,y,s){ let h=(Math.imul(x|0,374761393)+Math.imul(y|0,668265263)+Math.imul(s|0,1442695041))|0; h=Math.imul(h^(h>>>13),1274126177); h^=h>>>16; return (h>>>0)/4294967296; }
+function vnoise(x,y,s){ const xi=Math.floor(x),yi=Math.floor(y),xf=x-xi,yf=y-yi; const u=xf*xf*(3-2*xf),v=yf*yf*(3-2*yf);
+  const a=hash2(xi,yi,s),b=hash2(xi+1,yi,s),c=hash2(xi,yi+1,s),d=hash2(xi+1,yi+1,s); return a+(b-a)*u+(c-a)*v+(a-b-c+d)*u*v; }
+function fbm(x,y,s=0){ let t=0,a=0.5,f=1,n=0; for(let i=0;i<4;i++){ t+=a*vnoise(x*f,y*f,s+i*31); n+=a; a*=0.5; f*=2.03; } return t/n; }
+
+/* ======================= COLOR HELPERS ======================= */
+const _c=new THREE.Color(), _a=new THREE.Color(), _b=new THREE.Color(), _hsl={h:0,s:0,l:0};
+const clamp01=v=>Math.min(1,Math.max(0,v));
+function jit(hex,j){ if(!j) return hex; _c.setHex(hex); _c.getHSL(_hsl,THREE.SRGBColorSpace);
+  _c.setHSL(_hsl.h+(rand()-.5)*j*0.12, clamp01(_hsl.s+(rand()-.5)*j*0.6), clamp01(_hsl.l+(rand()-.5)*j), THREE.SRGBColorSpace); return _c.getHex(); }
+function mixHex(a,b,t){ _a.setHex(a); _b.setHex(b); _a.lerp(_b,clamp01(t)); return _a.getHex(); }
+
+/* ======================= VOXEL STORE ======================= */
+const SOLID=new Map(), GLOW=new Map(), WATER=new Map(), FALLS=new Map(), CLOUD=new Map(), MIST=new Map();
+const FLORA=[], LIGHTS=[], PETAL_SRC=[];
+const HMAP=new Map(), SURF=new Map(), BOT=new Map();
+const key=(x,y,z)=>((x+512)*1024+(y+512))*1024+(z+512);
+function unkey(k){ const z=k%1024; const r=(k-z)/1024; const y=r%1024; const x=(r-y)/1024; return [x-512,y-512,z-512]; }
+const ck=(x,z)=>(x+512)*1024+(z+512);
+const R_=Math.round;
+function S(x,y,z,c,j=0.06){ const k=key(R_(x),R_(y),R_(z)); SOLID.set(k,jit(c,j)); GLOW.delete(k); WATER.delete(k); }
+function SE(x,y,z,c,j=0.06){ const k=key(R_(x),R_(y),R_(z)); if(SOLID.has(k)||GLOW.has(k)) return; SOLID.set(k,jit(c,j)); WATER.delete(k); }
+function G(x,y,z,c,j=0.03){ const k=key(R_(x),R_(y),R_(z)); GLOW.set(k,jit(c,j)); SOLID.delete(k); }
+function D(x,y,z){ const k=key(R_(x),R_(y),R_(z)); SOLID.delete(k); GLOW.delete(k); }
+function W(x,y,z,c,j=0.04){ WATER.set(key(R_(x),R_(y),R_(z)),jit(c,j)); }
+function box(x0,y0,z0,x1,y1,z1,c,j=0.05){ for(let x=x0;x<=x1;x++)for(let y=y0;y<=y1;y++)for(let z=z0;z<=z1;z++) S(x,y,z,c,j); }
+const gY=(x,z)=>{ const v=HMAP.get(ck(R_(x),R_(z))); return v===undefined?null:v; };
+const DIRS4=[[1,0],[-1,0],[0,1],[0,-1]];
+
+function line(a,b,c,thick=0,empty=false){
+  const n=Math.ceil(Math.max(Math.abs(b[0]-a[0]),Math.abs(b[1]-a[1]),Math.abs(b[2]-a[2]))*1.5)+1;
+  const f=empty?SE:S;
+  for(let i=0;i<=n;i++){ const t=i/n; const x=a[0]+(b[0]-a[0])*t, y=a[1]+(b[1]-a[1])*t, z=a[2]+(b[2]-a[2])*t;
+    f(x,y,z,c,0.05); if(thick) for(const [ax,az] of DIRS4) f(x+ax,y,z+az,c,0.05); }
+}
+function blob(cx,cy,cz,rx,ry,rz,fn,dens=1){
+  for(let x=Math.floor(cx-rx-1);x<=Math.ceil(cx+rx+1);x++)
+  for(let y=Math.floor(cy-ry-1);y<=Math.ceil(cy+ry+1);y++)
+  for(let z=Math.floor(cz-rz-1);z<=Math.ceil(cz+rz+1);z++){
+    const dx=(x-cx)/rx, dy=(y-cy)/ry, dz=(z-cz)/rz; const d=dx*dx+dy*dy+dz*dz;
+    if(d>1+(rand()-.5)*0.3) continue; if(d>0.5 && rand()>dens) continue;
+    const c=fn(x,y,z,dy,d); if(c!=null) SE(x,y,z,c,0.06);
+  }
+}
+function trunkSlice(x,y,z,thick,c){ S(x,y,z,c,0.06); if(thick) for(const [ax,az] of DIRS4) S(x+ax,y,z+az,c,0.06); }
+
+/* ======================= PALETTES ======================= */
+const PINK_L=[0xffd1dc,0xffc2d4,0xffe0ea,0xfff2f6,0xffb8cc,0xfcc9e0];
+const PINK_D=[0xf48fb1,0xf06a9b,0xff9ec0,0xe8799f,0xffa8c5,0xd9628f];
+const MAPLE_R=[0xd7263d,0xe63946,0xc1121f,0xb5172b,0xe5383b];
+const MAPLE_O=[0xf25c2a,0xff7b25,0xff9f1c,0xffb627,0xf3722c];
+const GINKGO=[0xf7d03c,0xf2c12e,0xffdd57,0xe8b423,0xffe680];
+const PINE_D=[0x24502a,0x2e5e2a,0x2a5a30], PINE_L=[0x3f7a35,0x4b8a3c,0x5a9a45];
+const LEAF=[0x3f7f35,0x4b8f3c,0x356e2d,0x5a9c44];
+const STRATA=[0x8c8f96,0x7b7e86,0xa09784,0x8a8378,0x6f727a,0xb0a48c,0x7d7468];
+const FLOWERS=[[0xffffff,0xfff3b0],[0xffd23f,0xffb627],[0xc77dff,0x9d4edd],[0xff6b9d,0xff8fab],[0x74c0fc,0x4dabf7],[0xff5d5d,0xffffff]];
+const AZ_P=[0xff5fa2,0xff85b8,0xf72585,0xff70a6], AZ_W=[0xffffff,0xfff0f6,0xffe3ef], AZ_R=[0xff3b3b,0xff6b6b,0xff4d6d];
+const HYD=[0x6c8cff,0x8f7bff,0xb08cff,0x5fa8ff,0x7ab8ff];
+
+function grassColor(x,z){ const n=fbm(x*.08,z*.08,21); return mixHex(0x4e9a3a,0x9bd862,(n-0.3)*2.4); }
+function stoneColor(x,y,z){ const b=Math.floor((y+fbm(x*.07,z*.07,31)*7)/2.2); return STRATA[((b%7)+7)%7]; }
+
+/* ======================= LAYOUT ======================= */
+const PZ=-14;
+const STREAM1=[[-30,-17],[-30,-7],[-27,3],[-22,11],[-16,15]];
+const STREAM2=[[4,19],[14,24],[24,27],[34,31],[44,36],[60,44]];
+function islandEdge(x,z){ return 46+16*(fbm(x*.03+5,z*.03-3,7)-0.5); }
+function inIsland(x,z){ return Math.hypot(x,z)<islandEdge(x,z); }
+function pondVal(x,z){ const dx=(x+10)/17, dz=(z-17)/7.5; return dx*dx+dz*dz+(fbm(x*.15,z*.15,5)-.5)*.5; }
+function distSeg(px,pz,ax,az,bx,bz){ const vx=bx-ax,vz=bz-az; const t=Math.max(0,Math.min(1,((px-ax)*vx+(pz-az)*vz)/(vx*vx+vz*vz))); return Math.hypot(px-ax-vx*t,pz-az-vz*t); }
+function distPoly(px,pz,P){ let m=1e9; for(let i=0;i<P.length-1;i++) m=Math.min(m,distSeg(px,pz,P[i][0],P[i][1],P[i+1][0],P[i+1][1])); return m; }
+function terrainH(x,z){
+  let h=Math.floor(fbm(x*.06,z*.06,1)*2.3);
+  if(z<=-19){ const dh=Math.hypot(x+31,(z+29)*1.15); if(dh<15) h+=Math.round((15-dh)*1.6+fbm(x*.25,z*.25,4)*3); }
+  const dm=Math.hypot(x+37,z-24); if(dm<9) h+=Math.round((9-dm)*0.55);
+  const db=Math.hypot(x-32,z+30); if(db<13) h+=Math.floor((13-db)*0.22);
+  if(Math.abs(x)<=15 && z>=-30 && z<=2) h=0;
+  if(Math.abs(x)<=4 && z>=-2) h=0;
+  if(x>=12 && x<=34 && z>=-8 && z<=14) h=0;
+  return h;
+}
+
+/* ======================= BUILDERS ======================= */
+function litter(x,z,R,pal,p){
+  for(let dx=-Math.ceil(R);dx<=R;dx++)for(let dz=-Math.ceil(R);dz<=R;dz++){
+    const dd=Math.hypot(dx,dz); if(dd>R) continue;
+    const X=R_(x+dx), Z=R_(z+dz), k=ck(X,Z); const sf=SURF.get(k);
+    if(!(sf==='grass'||sf==='shore'||sf==='gravel'||sf==='path')) continue;
+    if(rand()<p*(1-dd/R)+0.03) S(X,HMAP.get(k),Z,pick(pal),0.04);
+  }
+}
+
+function sakura(x,z,s=1,weep=false){
+  const g=gY(x,z); if(g==null||g<0) return; const y0=g+1;
+  const th=R_(rr(5,7)*s); const la=rr(0,Math.PI*2), lx=Math.cos(la), lz=Math.sin(la);
+  const BARK=0x5a3a2b, TWIG=0x6e4a36; let tx=x,tz=z;
+  for(let i=0;i<th;i++){ const off=Math.sin(i/th*Math.PI*0.7)*1.4*s; tx=x+lx*off; tz=z+lz*off; trunkSlice(tx,y0+i,tz,(i<2||(s>=1.1&&i<th-2))?1:0,BARK); }
+  for(const [ax,az] of DIRS4) if(rand()<0.7) S(x+ax*2,y0,z+az*2,BARK,0.06);
+  const top=[tx,y0+th-1,tz], ends=[]; const nb=ri(4,6);
+  for(let b=0;b<nb;b++){
+    const a=b/nb*Math.PI*2+rr(-.35,.35), L=rr(4.5,7.5)*s;
+    const e=[top[0]+Math.cos(a)*L, top[1]+(weep?rr(0.5,2.5):rr(1.5,4.5))*s, top[2]+Math.sin(a)*L];
+    const mid=[(top[0]+e[0])/2,(top[1]+e[1])/2+rr(0,1),(top[2]+e[2])/2];
+    line(top,mid,BARK,s>1.15?1:0,true); line(mid,e,TWIG,0,true); ends.push(e);
+    if(rand()<0.6){ const a2=a+rr(-.9,.9); const e2=[mid[0]+Math.cos(a2)*L*0.55, mid[1]+rr(1,3)*s, mid[2]+Math.sin(a2)*L*0.55]; line(mid,e2,TWIG,0,true); ends.push(e2); }
+  }
+  ends.push([top[0],top[1]+3.2*s,top[2]]);
+  const fn=(px,py,pz,dy)=>{ const r=rand(); if(r<0.025) return 0x86b85a; if(r<0.04) return TWIG;
+    if(dy>0.15) return pick(PINK_L); if(dy<-0.35) return pick(PINK_D); return rand()<0.55?pick(PINK_L):pick(PINK_D); };
+  for(const e of ends){
+    const r=rr(3.2,4.6)*s; blob(e[0],e[1],e[2],r,r*0.72,r,fn,0.78); PETAL_SRC.push({x:e[0],y:e[1],z:e[2],r});
+    if(weep){ for(let k=0;k<22;k++){ const a=rand()*Math.PI*2, rad=r*rr(0.45,1.05);
+      const sx=e[0]+Math.cos(a)*rad, sz=e[2]+Math.sin(a)*rad, sy=e[1]-r*0.25; const len=R_(rr(4,11)*s); const gg=gY(sx,sz) ?? -50;
+      for(let i=0;i<len;i++){ const yy=sy-i; if(yy<=gg+1) break; if(rand()<0.88) SE(sx,yy,sz,i>len-3?pick(PINK_L):pick(PINK_D),0.05); } } }
+  }
+  litter(x,z,8*s,[...PINK_L,...PINK_D],0.4);
+}
+
+function maple(x,z,s=1){
+  const g=gY(x,z); if(g==null||g<0) return; const y0=g+1; const th=R_(rr(4,5.5)*s); const BARK=0x4a3226;
+  for(let i=0;i<th;i++) trunkSlice(x,y0+i,z,i<2?1:0,BARK);
+  const top=[x,y0+th-1,z], ends=[]; const nb=ri(4,6);
+  for(let b=0;b<nb;b++){ const a=b/nb*Math.PI*2+rr(-.4,.4), L=rr(3.5,6)*s; const e=[x+Math.cos(a)*L, top[1]+rr(1,3)*s, z+Math.sin(a)*L]; line(top,e,BARK,0,true); ends.push(e); }
+  ends.push([x,top[1]+3*s,z]);
+  const fn=(px,py,pz,dy,d)=> dy>0.15? pick(MAPLE_R) : (d>0.7&&rand()<0.4? pick(MAPLE_O) : (rand()<0.5?pick(MAPLE_R):pick(MAPLE_O)));
+  for(const e of ends){ const r=rr(2.8,4)*s; blob(e[0],e[1],e[2],r,r*0.6,r,fn,0.82); }
+  litter(x,z,6*s,[...MAPLE_R,...MAPLE_O],0.25);
+}
+
+function ginkgo(x,z,s=1){
+  const g=gY(x,z); if(g==null||g<0) return; const y0=g+1; const th=R_(rr(8,10)*s);
+  for(let i=0;i<th;i++) trunkSlice(x,y0+i,z,i<2?1:0,0x5b4636);
+  for(let k=0;k<4;k++){ const yy=y0+3+k*2.6*s, r=(4.8-k*0.95)*s;
+    blob(x+rr(-.5,.5),yy,z+rr(-.5,.5),r,r*0.55,r,(px,py,pz,dy)=> dy>0? pick(GINKGO) : (rand()<0.3?0xd9a21b:pick(GINKGO)),0.85); }
+  litter(x,z,6*s,GINKGO,0.3);
+}
+
+function pine(x,z,s=1){
+  const g=gY(x,z); if(g==null||g<0) return; const y0=g+1; const th=R_(rr(7,10)*s);
+  const la=rr(0,Math.PI*2), lx=Math.cos(la), lz=Math.sin(la); const pts=[];
+  for(let i=0;i<th;i++){ const f=Math.pow(i/th,1.5)*3.5*s; const px=x+lx*f+Math.sin(i*0.7)*0.6, pz=z+lz*f;
+    trunkSlice(px,y0+i,pz,i<2?1:0,i%3?0x6b4b3a:0x5a3d2e); pts.push([px,y0+i,pz]); }
+  const fn=(px,py,pz,dy)=> dy>0.1? pick(PINE_L) : pick(PINE_D);
+  const np=ri(4,6);
+  for(let k=0;k<np;k++){ const p=pts[Math.floor(th*rr(0.4,0.95))]; const a=rr(0,Math.PI*2), L=rr(2,4.5)*s;
+    const e=[p[0]+Math.cos(a)*L, p[1]+rr(0,1.5), p[2]+Math.sin(a)*L]; line(p,e,0x5a3d2e,0,true);
+    const r=rr(2.2,3.4)*s; blob(e[0],e[1]+0.5,e[2],r,1.3,r,fn,0.95); }
+  const tp=pts[pts.length-1]; blob(tp[0],tp[1]+1,tp[2],2.6*s,1.4,2.6*s,fn,0.95);
+}
+
+function bambooStalk(x,z){
+  const g=gY(x,z); if(g==null||g<0) return; const y0=g+1, h=ri(12,22); const base=pick([0x6aa84f,0x7cb85c,0x5d9a44,0x8bc06a]);
+  for(let i=0;i<h;i++) S(x,y0+i,z,i%4===3?0xb7d68a:base,0.04);
+  for(let k=0;k<5;k++){ const yy=y0+h-ri(0,7); const [dx,dz]=pick(DIRS4); const n=ri(2,4);
+    for(let i=1;i<=n;i++) SE(x+dx*i,yy-(i>2?1:0),z+dz*i,pick([0x5e9e3a,0x7fbf4f,0x4c8a31]),0.06); }
+  SE(x,y0+h,z,0x7fbf4f);
+}
+
+function bush(x,z,r,flowers,fr=0.4){
+  const g=gY(x,z); if(g==null||g<0) return;
+  blob(x,g+0.6,z,r,r*0.8,r,(px,py,pz,dy)=> py<=g? null : (rand()<fr&&dy>-0.4? pick(flowers) : pick(LEAF)),0.95);
+}
+function rockAt(x,z,r,h,g){
+  g = g ?? gY(x,z); if(g==null) return;
+  blob(x,g+0.5,z,r,h,r*rr(0.75,1),(px,py,pz,dy)=> py<=g? null : (dy>0.4&&rand()<0.55? pick([0x6f8f45,0x7fa050,0x5f8a3e]) : pick([0x8a8784,0x7a7774,0x9a9690,0x6e6b68])),1);
+}
+
+function lantern(x,z){
+  const g=gY(x,z); if(g==null||g<0) return; const y=g+1; const st=0x9a9893, st2=0x84827d, LG=0xffc861;
+  for(let dx=-1;dx<=1;dx++)for(let dz=-1;dz<=1;dz++){ const gg=gY(x+dx,z+dz); if(gg!=null) for(let yy=gg+1;yy<y;yy++) S(x+dx,yy,z+dz,st2,0.05);
+    S(x+dx,y,z+dz,st2,0.05); S(x+dx,y+3,z+dz,st,0.05); }
+  S(x,y+1,z,st,0.05); S(x,y+2,z,st,0.05);
+  for(let dx=-1;dx<=1;dx++)for(let dz=-1;dz<=1;dz++){ if(dx&&dz) S(x+dx,y+4,z+dz,st,0.05); else G(x+dx,y+4,z+dz,LG); }
+  for(let dx=-2;dx<=2;dx++)for(let dz=-2;dz<=2;dz++){ const corner=Math.abs(dx)===2&&Math.abs(dz)===2; S(x+dx,y+5,z+dz,corner?st2:(rand()<0.2?0x6f8a55:st),0.05); }
+  for(let dx=-1;dx<=1;dx++)for(let dz=-1;dz<=1;dz++) S(x+dx,y+6,z+dz,st2,0.05);
+  S(x,y+7,z,st,0.05);
+  LIGHTS.push({x,y:y+4,z,c:0xffb04a});
+}
+
+function chochin(x,z){
+  const g=gY(x,z); if(g==null||g<0) return; const y=g+1;
+  S(x,y,z,0x3a2a20); S(x,y+1,z,0x3a2a20); S(x,y+2,z,0x3a2a20); S(x,y+3,z,0x222222);
+  G(x,y+4,z,0xff5a2e); G(x,y+5,z,0xff7a3e); S(x,y+6,z,0x222222);
+  LIGHTS.push({x,y:y+5,z,c:0xff6a3a});
+}
+
+function pagoda(cx,cz){
+  const RED=0xb3271c, RED2=0xc93a22, WOOD=0x4a2a18, PLASTER=0xf1e8d6, GOLD=0xe8b53e, PAPER=0xffe2a6;
+  const TILE=0x3f8f7f, TILE2=0x347767, HIP=0x74c6b2, TRIM=0xe6b847;
+  const P=12;
+  for(let dx=-P;dx<=P;dx++) for(let dz=-P;dz<=P;dz++) for(let y=1;y<=3;y++){
+    const edge=Math.abs(dx)===P||Math.abs(dz)===P; let c;
+    if(edge) c = y===3? 0x8d8a83 : (rand()<0.15? 0x6f8a55 : 0x7b7871);
+    else c = ((Math.floor(dx/2)+Math.floor(dz/2))&1)? 0xaaa69d : 0x97938b;
+    S(cx+dx,y,cz+dz,c,0.04);
+  }
+  for(let dx=-3;dx<=3;dx++){ S(cx+dx,1,cz+P+1,0xb3afa5,0.04); S(cx+dx,2,cz+P+1,0xb3afa5,0.04); S(cx+dx,1,cz+P+2,0xb3afa5,0.04); }
+  for(let dx=-P;dx<=P;dx++) for(let dz=-P;dz<=P;dz++){
+    if(Math.max(Math.abs(dx),Math.abs(dz))!==P) continue; if(dz===P && Math.abs(dx)<=3) continue;
+    const u=Math.abs(dx)===P? dz : dx; const corner=Math.abs(dx)===P&&Math.abs(dz)===P;
+    if(corner || ((u%3)+3)%3===0) S(cx+dx,4,cz+dz,RED,0.03);
+    S(cx+dx,5,cz+dz,RED2,0.03);
+    if(corner || (dz===P&&Math.abs(dx)===4)) S(cx+dx,6,cz+dz,GOLD,0.03);
+  }
+  // golden Buddha inside, visible through the door
+  G(cx-1,4,cz+3,0xffc04a); G(cx,4,cz+3,0xffc04a); G(cx+1,4,cz+3,0xffc04a);
+  G(cx,5,cz+3,0xffcf5a); G(cx,6,cz+3,0xffcf5a); G(cx,7,cz+3,0xffe08a);
+  LIGHTS.push({x:cx,y:7,z:cz+6,c:0xffb860});
+
+  const tiers=[{w:8,h:7},{w:7,h:5},{w:6,h:5},{w:5,h:4},{w:4,h:4}];
+  let y0=4;
+  for(let i=0;i<tiers.length;i++){
+    const {w,h}=tiers[i]; const top=i===tiers.length-1; const wn=top?-1:tiers[i+1].w;
+    for(let dx=-w;dx<=w;dx++) for(let dz=-w;dz<=w;dz++){
+      const ax=Math.abs(dx), az=Math.abs(dz); if(ax!==w && az!==w) continue;
+      const u=ax===w? dz : dx;
+      for(let t=0;t<h;t++){
+        const X=cx+dx, Y=y0+t, Z=cz+dz;
+        if(i===0 && dz===w && Math.abs(dx)<=1 && t>=1 && t<=4) continue;
+        if(ax===w&&az===w){ S(X,Y,Z,RED,0.03); continue; }
+        if(t===0){ S(X,Y,Z,WOOD,0.04); continue; }
+        if(t===h-1){ S(X,Y,Z,RED2,0.03); continue; }
+        if(i===0 && dz===w && Math.abs(dx)<=2 && t===5){ S(X,Y,Z,GOLD,0.03); continue; }
+        if(((u%3)+3)%3===0){ S(X,Y,Z,RED,0.03); continue; }
+        if(t>=2 && t<=h-2){ if(((u+t)&1)===0) G(X,Y,Z,PAPER,0.03); else S(X,Y,Z,WOOD,0.03); continue; }
+        S(X,Y,Z,PLASTER,0.03);
+      }
+    }
+    const r=w+4, yb=y0+h, ry=yb+1;
+    for(let dx=-(r-1);dx<=r-1;dx++) for(let dz=-(r-1);dz<=r-1;dz++){
+      const ax=Math.abs(dx), az=Math.abs(dz), m=Math.max(ax,az); const u=ax>=az? dz: dx; const par=((u%2)+2)%2;
+      const c = m<=w? WOOD : m===w+1 ? (par? 0x2f8f78 : 0xe0a030) : (par? 0xf3ead8 : 0x6b3d22);
+      S(cx+dx,yb,cz+dz,c,0.04);
+    }
+    const layers=[];
+    for(let k=0;;k++){ const rk=k===0? r : r-1-k; if(top? rk<0 : rk<wn) break; layers.push(rk); }
+    layers.forEach((rk,k)=>{ const Y=ry+k;
+      for(let dx=-rk;dx<=rk;dx++) for(let dz=-rk;dz<=rk;dz++){
+        const ax=Math.abs(dx), az=Math.abs(dz), m=Math.max(ax,az); let c;
+        if(k===0 && m===rk) c=TRIM; else if(ax===az) c=HIP; else { const u=ax>az? dz: dx; c=(u&1)? TILE : TILE2; }
+        S(cx+dx,Y,cz+dz,c,0.05);
+      }
+    });
+    for(const sx of [-1,1]) for(const sz of [-1,1]){
+      for(let a=r-4;a<=r-1;a++){ const c=a===r-1?HIP:TILE; S(cx+sx*(r-1),ry+1,cz+sz*a,c,0.04); S(cx+sx*a,ry+1,cz+sz*(r-1),c,0.04); }
+      for(let a=r-2;a<=r;a++){ S(cx+sx*r,ry+1,cz+sz*a,TRIM,0.03); S(cx+sx*a,ry+1,cz+sz*r,TRIM,0.03); }
+      S(cx+sx*(r+1),ry+2,cz+sz*(r+1),GOLD,0.02);
+      S(cx+sx*r,yb,cz+sz*r,0x2a2a2a,0.02);
+      S(cx+sx*r,yb-1,cz+sz*r,GOLD,0.03);
+    }
+    if(top){
+      const py=ry+layers.length;
+      box(cx-1,py,cz-1,cx+1,py,cz+1,0x5a4630,0.04);
+      for(let k=1;k<=18;k++) S(cx,py+k,cz,GOLD,0.03);
+      for(let k=0;k<8;k++){ const yy=py+3+k*2; for(let dx=-1;dx<=1;dx++)for(let dz=-1;dz<=1;dz++) if(dx||dz) S(cx+dx,yy,cz+dz,0xd9a520,0.05); }
+      G(cx,py+19,cz,0xffd27a); for(const [ax,az] of DIRS4) G(cx+ax,py+19,cz+az,0xffb84a);
+      G(cx,py+20,cz,0xffe9a8); G(cx,py+21,cz,0xfff3c8);
+    }
+    y0=ry+2;
+  }
+}
+
+function torii(cx,cz){
+  const RD=0xe2401f, K=0x1d1a1a, GP=0xe9c46a; const y=(gY(cx,cz)??0)+1;
+  for(const px of [-6,-5,5,6]) for(const pz of [cz,cz+1]){
+    const g=gY(cx+px,pz); for(let yy=(g??0)+1;yy<y;yy++) S(cx+px,yy,pz,K);
+    S(cx+px,y,pz,K,0.03); for(let yy=y+1;yy<=y+10;yy++) S(cx+px,yy,pz,RD,0.03);
+  }
+  for(let x=-8;x<=8;x++) for(const pz of [cz,cz+1]){ S(cx+x,y+7,pz,RD,0.03); S(cx+x,y+11,pz,RD,0.03); }
+  for(let x=-9;x<=9;x++) for(let pz=cz-1;pz<=cz+2;pz++) S(cx+x,y+12,pz,K,0.03);
+  for(const sx of [-1,1]) for(let pz=cz-1;pz<=cz+2;pz++) S(cx+sx*10,y+13,pz,K,0.03);
+  for(const pz of [cz,cz+1]) for(let yy=y+8;yy<=y+10;yy++) S(cx,yy,pz,RD);
+  for(let x=-1;x<=1;x++) for(let yy=y+8;yy<=y+10;yy++) S(cx+x,yy,cz+2,x===0?GP:K,0.02);
+}
+
+function bridge(){
+  const RD=0xd6402a, GOLD=0xe8b84a;
+  for(let z=8;z<=26;z++){
+    const yd=R_(5*Math.sin(Math.PI*(z-8)/18));
+    for(let x=-3;x<=3;x++){
+      const ground=gY(x,z);
+      if(Math.abs(x)<=2) S(x,yd,z,(z&1)?0x9c6b3e:0x8a5a32,0.04); else S(x,yd,z,RD,0.03);
+      if(ground!=null && ground>=0){ for(let y=ground+1;y<yd;y++) S(x,y,z,0x8a8680,0.05); }
+      else if(yd>=1) S(x,yd-1,z,RD,0.03);
+    }
+    for(const sx of [-3,3]){ S(sx,yd+2,z,RD,0.03); if((z-8)%3===0||z===26){ S(sx,yd+1,z,RD,0.03); SE(sx,yd+3,z,GOLD,0.03); } }
+  }
+}
+
+function rockGarden(){
+  const X0=14,X1=32,Z0=-6,Z1=12;
+  const rocks=[{x:20,z:-1,r:2.6,h:2.6},{x:27,z:7,r:2,h:2.2},{x:28,z:-3,r:1.4,h:1.5},{x:18,z:8,r:1.3,h:1.3}];
+  for(let x=X0;x<=X1;x++) for(let z=Z0;z<=Z1;z++){
+    const k=ck(x,z); const g=HMAP.get(k); if(g==null) continue;
+    if(x===X0||x===X1||z===Z0||z===Z1){ S(x,g,z,0x6f6b65); S(x,g+1,z,0x7a766f,0.06); SURF.set(k,'border'); continue; }
+    let best=1e9; for(const r of rocks) best=Math.min(best,Math.hypot(x-r.x,z-r.z)-r.r);
+    let c; if(best<0.8) c=0x5f8a3e; else if(best<5) c=(Math.floor(best)%2===0)?0xece6d6:0xc9c1ab; else c=(z&1)?0xece6d6:0xc9c1ab;
+    S(x,g,z,c,0.03); SURF.set(k,'zen');
+  }
+  for(const r of rocks) rockAt(r.x,r.z,r.r,r.h,0);
+}
+
+function wisteria(x0,z0){
+  const Wd=7,Dp=5, POST=0x5a3a24, BEAM=0x6b4428; let gmax=0;
+  for(let x=x0;x<x0+Wd;x++)for(let z=z0;z<z0+Dp;z++){ const g=gY(x,z); if(g!=null) gmax=Math.max(gmax,g); }
+  const top=gmax+7;
+  for(const [px,pz] of [[x0,z0],[x0+Wd-1,z0],[x0,z0+Dp-1],[x0+Wd-1,z0+Dp-1]]){ const g=gY(px,pz)??0; for(let y=g+1;y<top;y++) S(px,y,pz,POST,0.04); }
+  for(let x=x0-1;x<=x0+Wd;x++){ S(x,top,z0,BEAM,0.04); S(x,top,z0+Dp-1,BEAM,0.04); }
+  for(let x=x0;x<x0+Wd;x+=2) for(let z=z0-1;z<=z0+Dp;z++) S(x,top+1,z,BEAM,0.04);
+  const WIS=[0x7e57c2,0x9575cd,0xb39ddb,0xd1c4e9];
+  for(let x=x0-1;x<=x0+Wd;x++) for(let z=z0-1;z<=z0+Dp;z++){
+    if(rand()<0.55) SE(x,top+2,z,rand()<0.35?pick(WIS):pick(LEAF),0.06);
+    if(rand()<0.55){ const len=ri(2,5); for(let k=0;k<len;k++) SE(x,top-1-k,z,WIS[Math.min(3,k)],0.05); }
+  }
+}
+
+function islet(cx,cz,ty,R){
+  for(let x=cx-R-2;x<=cx+R+2;x++)for(let z=cz-R-2;z<=cz+R+2;z++){
+    const d=Math.hypot(x-cx,z-cz); const e=R+(fbm(x*.2,z*.2,77)-0.5)*3; if(d>=e) continue;
+    const t=1-d/e; const bottom=ty-Math.floor(2+Math.pow(t,0.6)*R*1.6+fbm(x*.3,z*.3,78)*3);
+    const top=ty+(d<e*0.5?1:0);
+    for(let y=bottom;y<=top;y++){ const dep=top-y; S(x,y,z, dep===0?grassColor(x,z): dep<=1? 0x7a5233 : stoneColor(x,y,z), 0.07); }
+    HMAP.set(ck(x,z),top); SURF.set(ck(x,z),'grass');
+  }
+}
+
+/* ======================= WORLD GENERATION ======================= */
+function generate(){
+  // main floating island
+  for(let x=-62;x<=62;x++) for(let z=-62;z<=62;z++){
+    const d=Math.hypot(x,z), e=islandEdge(x,z); if(d>=e) continue;
+    const h=terrainH(x,z), t=1-d/e;
+    const bottom=-Math.floor(3+Math.pow(t,0.55)*30+fbm(x*.13,z*.13,9)*9);
+    const pv=pondVal(x,z), inPond=pv<1;
+    const inStream=!inPond&&(distPoly(x,z,STREAM1)<1.6||distPoly(x,z,STREAM2)<1.6);
+    let top=h, surf='grass';
+    if(inPond){ top=pv<0.4?-4:-3; surf='pond'; } else if(inStream){ top=-2; surf='stream'; }
+    let steep=0; if(surf==='grass') for(const [ax,az] of DIRS4) steep=Math.max(steep,h-terrainH(x+ax,z+az));
+    const rocky=surf==='grass' && (steep>=2 || (h>=8 && rand()<0.3));
+    const shore=surf==='grass' && !rocky && pv<1.22;
+    if(rocky) surf='rock'; else if(shore) surf='shore';
+    for(let y=bottom;y<=top;y++){
+      const dep=top-y; let c;
+      if(dep===0){
+        if(surf==='pond'||surf==='stream') c = rand()<0.3? pick([0x9a958c,0x7f7a72,0xb5ab95]) : 0xd6c49a;
+        else if(surf==='rock') c = rand()<0.55? 0x7d8f62 : 0x8b8d8f;
+        else if(surf==='shore') c = rand()<0.5? 0xcdbf98 : pick([0x9d978d,0x86817a,0x6e9a48]);
+        else c = grassColor(x,z);
+      } else if(dep<=2 && h<4){
+        c = (e-d<1.6 && dep===1 && rand()<0.6)? 0x4f9a3e : (rand()<0.5?0x7a5233:0x6a472c);
+      } else { c=stoneColor(x,y,z); if(h>=4 && y>0 && rand()<0.14) c=0x6f8a55; }
+      S(x,y,z,c,0.07);
+    }
+    HMAP.set(ck(x,z),top); BOT.set(ck(x,z),bottom); SURF.set(ck(x,z),surf);
+    if(inPond) W(x,-1,z,mixHex(0x2a86ad,0x4cb8d2,rand()*0.6+fbm(x*.2,z*.2,3)*0.4));
+    else if(inStream) W(x,-1,z,0x58c0dc);
+    // hanging vines off the island rim
+    if(e-d<1.4 && !inStream && !inPond && rand()<0.22){
+      const ox=R_(x/d*1.4), oz=R_(z/d*1.4), vx=x+ox, vz=z+oz;
+      if(!inIsland(vx,vz)){ const len=ri(3,12); for(let k=0;k<len;k++){ const c=rand()<0.08? pick([0xffffff,0xffb3d1,0xffd166]) : pick([0x3e8e41,0x4fa34a,0x2f7a36]); S(vx,top-k,vz,c,0.05); } }
+    }
+  }
+  // hill waterfall
+  for(let x=-31;x<=-29;x++){
+    const h19=HMAP.get(ck(x,-19));
+    for(let z=-23;z<=-19;z++){ const k=ck(x,z); const hh=HMAP.get(k); if(hh==null) continue; D(x,hh,z); W(x,hh,z,0x63c6e2); HMAP.set(k,hh-1); SURF.set(k,'stream'); }
+    if(h19!=null) for(let y=h19;y>=0;y--) FALLS.set(key(x,y,-18),jit(0x8fd8f0,0.05));
+  }
+  for(let x=-32;x<=-28;x++) for(let z=-17;z<=-15;z++) if(SURF.get(ck(x,z))==='stream') W(x,-1,z,0xd9f4ff,0.03);
+  // waterfall spilling off the island edge
+  for(let x=-64;x<=64;x++) for(let z=-64;z<=64;z++){
+    if(HMAP.has(ck(x,z))) continue; if(distPoly(x,z,STREAM2)>=1.6) continue;
+    let adj=false; for(const [ax,az] of DIRS4) if(SURF.get(ck(x+ax,z+az))==='stream') adj=true; if(!adj) continue;
+    const L=Math.hypot(x,z), ux=x/L, uz=z/L;
+    for(let dd=0;dd<=46;dd++){ if(dd>26 && rand()<(dd-26)/20) continue; const off=Math.min(3.5,dd*dd*0.012);
+      FALLS.set(key(R_(x+ux*off),-1-dd,R_(z+uz*off)),jit(0x9fe2f5,0.05)); }
+    for(let k=0;k<30;k++) MIST.set(key(R_(x+ux*4)+ri(-3,3),-46+ri(-2,3),R_(z+uz*4)+ri(-3,3)),0xf5f9ff);
+  }
+  // temple courtyard gravel & path
+  for(let x=-15;x<=15;x++) for(let z=-30;z<=2;z++){ const k=ck(x,z); const g=HMAP.get(k); if(g==null||SURF.get(k)==='pond') continue; S(x,g,z,(z&1)?0xe3dbc7:0xd3cab3,0.03); SURF.set(k,'gravel'); }
+  for(let x=-2;x<=2;x++) for(let z=1;z<=60;z++){ if(z>8&&z<26) continue; const k=ck(x,z); const g=HMAP.get(k); if(g==null) continue;
+    const slab=Math.abs(x)<=1 && ((z+400)%4)<2; S(x,g,z,slab?0x8f8a84:0xd8cfb8,slab?0.06:0.04); SURF.set(k,'path'); }
+  for(const sx of [-3,3]) for(let z=1;z<=60;z++){ if(z>7&&z<27) continue; const g=gY(sx,z); if(g==null||g<0) continue;
+    if(rand()<0.3) FLORA.push({x:sx,y:g+1,z,c:pick([0x8f8a84,0xa29d96,0x77726c]),w:0.6,h:0.4}); }
+
+  rockGarden();
+  pagoda(0,PZ);
+  torii(0,40);
+  bridge();
+  chochin(-4,7); chochin(4,7); chochin(-4,27); chochin(4,27);
+  lantern(-6,3); lantern(6,3); lantern(-6,31); lantern(6,31);
+
+  // pond life: lily pads, rim rocks, reeds
+  for(const [k,s] of SURF){
+    const x=Math.floor(k/1024)-512, z=k%1024-512;
+    if(s==='pond'){ if(Math.abs(x)>3 && rand()<0.06){ S(x,-1,z,pick([0x4c9a3a,0x5aab45,0x3f8a33,0x67b84e]),0.05);
+        if(rand()<0.35) FLORA.push({x,y:0,z,c:pick([0xff8fb8,0xffffff,0xffb3d1,0xff6fa5]),w:0.6,h:0.45}); } }
+    else if(s==='shore'){ const g=HMAP.get(k); const r=rand();
+      if(r<0.1){ S(x,g+1,z,pick([0x8a8784,0x9a9690,0x77736e]),0.06); if(rand()<0.35) S(x,g+2,z,0x8a8784,0.06); }
+      else if(r<0.16){ const hh=ri(2,3); FLORA.push({x,y:g+1,z,c:0x6a9a3a,w:0.22,h:hh}); FLORA.push({x,y:g+1,z,c:0x6b4a2a,w:0.36,h:0.6,b:hh}); } }
+  }
+
+  islet(68,-28,8,7); islet(-66,30,-4,5);
+
+  // bamboo grove
+  for(let x=21;x<=44;x++) for(let z=-44;z<=-15;z++){ const k=ck(x,z); if(SURF.get(k)!=='grass') continue; const g=HMAP.get(k);
+    S(x,g,z,rand()<0.5? mixHex(0x8a9a4a,0xb09a5a,rand()) : grassColor(x,z),0.06);
+    if(rand()<0.13 && !SOLID.has(key(x+1,g+1,z)) && !SOLID.has(key(x-1,g+1,z)) && !SOLID.has(key(x,g+1,z+1)) && !SOLID.has(key(x,g+1,z-1))) bambooStalk(x,z); }
+
+  wisteria(17,31);
+  // trees
+  sakura(-21,-6,1.3); sakura(18,-26,1.05); sakura(-26,31,1.15,true); sakura(12,31,0.9); sakura(-12,35,0.95);
+  sakura(-8,-37,1.0); sakura(36,18,0.95); sakura(30,-11,0.85);
+  maple(8,-38,1.0); maple(37,2,0.9); maple(-36,8,0.95); maple(-17,-36,0.85);
+  ginkgo(24,17,1.0); ginkgo(-38,-5,0.9);
+  pine(-33,-31,1.0); pine(-25,-24,0.8); pine(-34,23,0.9);
+  sakura(67,-29,0.75); lantern(71,-25); pine(-66,30,0.55);
+
+  // bushes
+  for(const [x,z,pal,r] of [[11,4,AZ_P,1.8],[-11,4,AZ_P,1.8],[18,-12,AZ_R,1.7],[-18,-14,AZ_W,1.7],[17,-29,AZ_P,1.6],[-8,27,AZ_W,1.5],[30,22,AZ_R,1.6],[-32,15,AZ_P,1.7],[-14,-2,AZ_R,1.5],[14,-2,AZ_W,1.5]]) bush(x,z,r,pal,0.45);
+  for(const a of [0.3,1.2,2.0,2.6,3.6,4.4,5.4]){ const x=R_(-10+Math.cos(a)*20), z=R_(17+Math.sin(a)*10);
+    const sf=SURF.get(ck(x,z)); if((sf==='grass'||sf==='shore') && Math.abs(x)>5 && distPoly(x,z,STREAM1)>3 && distPoly(x,z,STREAM2)>3) bush(x,z,1.6,HYD,0.55); }
+
+  // wildflowers & grass tufts
+  for(let i=0;i<80;i++){ const a=rand()*Math.PI*2, rad=Math.sqrt(rand())*44; const fx=R_(Math.cos(a)*rad), fz=R_(Math.sin(a)*rad); const pal=pick(FLOWERS);
+    for(let dx=-2;dx<=2;dx++)for(let dz=-2;dz<=2;dz++){ if(rand()>0.4) continue; const X=fx+dx, Z=fz+dz, k=ck(X,Z); if(SURF.get(k)!=='grass') continue;
+      const g=HMAP.get(k); if(SOLID.has(key(X,g+1,Z))) continue; const ox=rr(-.2,.2), oz=rr(-.2,.2);
+      FLORA.push({x:X+ox,y:g+1,z:Z+oz,c:0x4f9a3e,w:0.1,h:0.4}); FLORA.push({x:X+ox,y:g+1,z:Z+oz,c:pick(pal),w:0.38,h:0.3,b:0.35}); } }
+  for(const [k,s] of SURF){ if(s!=='grass'||rand()>0.07) continue; const x=Math.floor(k/1024)-512, z=k%1024-512; const g=HMAP.get(k);
+    if(SOLID.has(key(x,g+1,z))) continue; FLORA.push({x:x+rr(-.3,.3),y:g+1,z:z+rr(-.3,.3),c:pick([0x7cc552,0x92d65f,0x5fae45]),w:0.22,h:rr(0.4,0.9)}); }
+
+  // glowing crystals under the island
+  const CRY=[0x7af5ff,0xc78bff,0xff8bd8,0x8bffb0,0x9ab8ff];
+  for(let i=0,tries=0;i<14&&tries<400;tries++){ const x=ri(-34,34), z=ri(-34,34); const b=BOT.get(ck(x,z)); if(b==null) continue; i++;
+    const c=pick(CRY), L=ri(3,7); for(let k=1;k<=L;k++) G(x,b-k,z,c);
+    for(const [ax,az] of DIRS4) if(rand()<0.6){ const bb=BOT.get(ck(x+ax,z+az)); if(bb==null) continue; const l2=ri(1,L-1); for(let k=1;k<=l2;k++) G(x+ax,bb-k,z+az,c); } }
+
+  // clouds
+  for(let i=0;i<14;i++){ const a=i/14*Math.PI*2+rr(-.2,.2), R=rr(85,140), cy=rr(-35,40); const cx=Math.cos(a)*R, cz=Math.sin(a)*R; const s=rr(0.8,1.5); const n=ri(3,6);
+    for(let p=0;p<n;p++){ const ox=cx+rr(-7,7)*s, oz=cz+rr(-4,4)*s, oy=cy+rr(-1,1.5); const rx=rr(3.5,6.5)*s, ry=rx*0.5, rz=rx*0.75;
+      for(let x=Math.floor(ox-rx);x<=Math.ceil(ox+rx);x++)for(let y=Math.floor(oy-ry);y<=Math.ceil(oy+ry);y++)for(let z=Math.floor(oz-rz);z<=Math.ceil(oz+rz);z++){
+        const q=((x-ox)/rx)**2+((y-oy)/ry)**2+((z-oz)/rz)**2; if(q<1+(rand()-.5)*.25) CLOUD.set(key(x,y,z), y<oy-ry*0.3? 0xdfe7f2 : 0xffffff); } } }
+}
+
+/* ======================= RENDERER / SCENE ======================= */
+const renderer=new THREE.WebGLRenderer({antialias:true,powerPreference:'high-performance'});
+const PR=Math.min(devicePixelRatio,2);
+renderer.setPixelRatio(PR); renderer.setSize(innerWidth,innerHeight);
+renderer.shadowMap.enabled=true; renderer.shadowMap.type=THREE.PCFSoftShadowMap; renderer.shadowMap.autoUpdate=false;
+renderer.toneMapping=THREE.ACESFilmicToneMapping; renderer.toneMappingExposure=1.05;
+document.body.appendChild(renderer.domElement);
+
+const scene=new THREE.Scene();
+scene.fog=new THREE.Fog(0xa8d8f2,260,700);
+const bgCanvas=document.createElement('canvas'); bgCanvas.width=4; bgCanvas.height=512;
+const bgCtx=bgCanvas.getContext('2d');
+const bgTex=new THREE.CanvasTexture(bgCanvas); bgTex.colorSpace=THREE.SRGBColorSpace; scene.background=bgTex;
+
+const camera=new THREE.PerspectiveCamera(42,innerWidth/innerHeight,0.5,3000);
+camera.position.set(110,80,135);
+const controls=new OrbitControls(camera,renderer.domElement);
+controls.target.set(0,16,0); controls.enableDamping=true; controls.dampingFactor=0.06;
+controls.autoRotate=true; controls.autoRotateSpeed=0.35; controls.minDistance=25; controls.maxDistance=420; controls.update();
+
+const hemi=new THREE.HemisphereLight(0xcfe8ff,0x6b5a45,1.15); scene.add(hemi);
+const fill=new THREE.DirectionalLight(0x9fb8ff,0.35); fill.position.set(0,-100,0); scene.add(fill);
+const sun=new THREE.DirectionalLight(0xfff0dc,3.2);
+sun.castShadow=true; sun.shadow.mapSize.set(4096,4096);
+Object.assign(sun.shadow.camera,{left:-85,right:85,top:85,bottom:-85,near:10,far:500});
+sun.shadow.camera.updateProjectionMatrix();
+sun.shadow.bias=-0.0004; sun.shadow.normalBias=0.05;
+sun.target.position.set(0,5,0); scene.add(sun,sun.target);
+
+const SUN_DIR=new THREE.Vector3(-0.55,0.8,0.42).normalize(), MOON_DIR=new THREE.Vector3(0.5,0.75,-0.45).normalize();
+const SUN_C=new THREE.Color(0xfff0dc), MOON_C=new THREE.Color(0x9db4ff);
+const HEMI_SKY_D=new THREE.Color(0xcfe8ff), HEMI_SKY_N=new THREE.Color(0x3a4a8a), HEMI_GR_D=new THREE.Color(0x6b5a45), HEMI_GR_N=new THREE.Color(0x1a1420);
+const DAY_TOP=new THREE.Color('#4fa6e8'), DAY_MID=new THREE.Color('#a8d8f2'), DAY_BOT=new THREE.Color('#ffdce8');
+const NIGHT_TOP=new THREE.Color('#050818'), NIGHT_MID=new THREE.Color('#141a3f'), NIGHT_BOT=new THREE.Color('#3a2652');
+
+const rt=new THREE.WebGLRenderTarget(innerWidth*PR,innerHeight*PR,{type:THREE.HalfFloatType,samples:4});
+const composer=new EffectComposer(renderer,rt);
+composer.setPixelRatio(PR); composer.setSize(innerWidth,innerHeight);
+composer.addPass(new RenderPass(scene,camera));
+const bloom=new UnrealBloomPass(new THREE.Vector2(innerWidth,innerHeight),0.3,0.5,1.05);
+composer.addPass(bloom);
+composer.addPass(new OutputPass());
+
+/* ======================= MATERIALS & MESHES ======================= */
+const boxGeo=new THREE.BoxGeometry(1,1,1);
+const solidMat=new THREE.MeshStandardMaterial({roughness:0.82,metalness:0});
+const glowMat=new THREE.MeshBasicMaterial({color:new THREE.Color(1.4,1.4,1.4)});
+const waterMat=new THREE.MeshStandardMaterial({transparent:true,opacity:0.72,roughness:0.08,metalness:0.1,depthWrite:false});
+const fallsMat=new THREE.MeshStandardMaterial({roughness:0.3});
+const cloudMat=new THREE.MeshStandardMaterial({roughness:1,emissive:0x8fa0b8,emissiveIntensity:0.25});
+const dummy=new THREE.Object3D(), col=new THREE.Color();
+
+function exposed(x,y,z,occ){ return !(occ.has(key(x+1,y,z))&&occ.has(key(x-1,y,z))&&occ.has(key(x,y+1,z))&&occ.has(key(x,y-1,z))&&occ.has(key(x,y,z+1))&&occ.has(key(x,y,z-1))); }
+function buildMesh(map,geo,mat,{occ=null,ao=false}={}){
+  const pos=[], cols=[];
+  for(const [k,c] of map){ const [x,y,z]=unkey(k); if(occ && !exposed(x,y,z,occ)) continue; pos.push(x,y,z); cols.push(c); }
+  const n=cols.length; const mesh=new THREE.InstancedMesh(geo,mat,Math.max(1,n)); mesh.count=n;
+  const m=new THREE.Matrix4();
+  for(let i=0;i<n;i++){
+    const x=pos[i*3],y=pos[i*3+1],z=pos[i*3+2]; m.makeTranslation(x,y,z); mesh.setMatrixAt(i,m); col.setHex(cols[i]);
+    if(ao){ let o=0; for(let dx=-1;dx<=1;dx++)for(let dz=-1;dz<=1;dz++){ if(occ.has(key(x+dx,y+1,z+dz))) o+=1; if((dx||dz)&&occ.has(key(x+dx,y,z+dz))) o+=0.35; }
+      col.multiplyScalar(Math.max(0.5,1.08-o*0.04)); }
+    mesh.setColorAt(i,col);
+  }
+  mesh.instanceMatrix.needsUpdate=true; if(mesh.instanceColor) mesh.instanceColor.needsUpdate=true;
+  mesh.frustumCulled=false; mesh.userData.pos=pos; mesh.userData.base=cols.map(h=>new THREE.Color(h));
+  return mesh;
+}
+
+let solidMesh, waterMesh, fallsMesh, cloudMesh, koiMesh, petalMesh, ffMesh, ffMat, starMat, sunMesh, moonMesh;
+const plights=[], kois=[], petals=[], ffs=[], cranes=[];
+let night=0, nightTarget=0;
+const clock=new THREE.Clock(false);
+
+function makeCrane(){
+  const g=new THREE.Group();
+  const Wm=new THREE.MeshStandardMaterial({color:0xf7f7f2,roughness:.7}), Bm=new THREE.MeshStandardMaterial({color:0x1e1e22,roughness:.7});
+  const Rm=new THREE.MeshStandardMaterial({color:0xd8232a,roughness:.6}), Ym=new THREE.MeshStandardMaterial({color:0xd9b44a,roughness:.5});
+  const add=(w,h,d,m,x,y,z,p=g)=>{ const me=new THREE.Mesh(new THREE.BoxGeometry(w,h,d),m); me.position.set(x,y,z); p.add(me); return me; };
+  add(1,0.9,2.4,Wm,0,0,0); add(0.4,0.4,1.6,Wm,0,0.45,1.75); add(0.5,0.5,0.6,Wm,0,0.7,2.65);
+  add(0.52,0.18,0.35,Rm,0,1.0,2.65); add(0.16,0.16,0.8,Ym,0,0.62,3.3); add(0.9,0.4,0.7,Bm,0,0.1,-1.45);
+  add(0.14,0.14,1.8,Bm,0.2,-0.25,-2.1); add(0.14,0.14,1.8,Bm,-0.2,-0.25,-2.1);
+  const wl=new THREE.Group(), wr=new THREE.Group(); wl.position.set(0.5,0.25,0.1); wr.position.set(-0.5,0.25,0.1); g.add(wl,wr);
+  add(3.2,0.14,1.3,Wm,1.6,0,0,wl); add(1.2,0.15,1.0,Bm,3.7,0,-0.1,wl);
+  add(3.2,0.14,1.3,Wm,-1.6,0,0,wr); add(1.2,0.15,1.0,Bm,-3.7,0,-0.1,wr);
+  scene.add(g); return {g,wl,wr};
+}
+
+function spawnPetal(p,init){ const s=pick(PETAL_SRC); p.x=s.x+rr(-s.r,s.r); p.z=s.z+rr(-s.r,s.r);
+  p.y=s.y+rr(-s.r*0.4,s.r*0.4)-(init?rr(0,12):0); p.vy=rr(0.7,1.6); p.ph=rr(0,6.28); p.sp=rr(1,3); p.rx=rr(0,6.28); p.rz=rr(0,6.28); }
+
+function buildScene(){
+  solidMesh=buildMesh(SOLID,boxGeo,solidMat,{occ:SOLID,ao:true}); solidMesh.castShadow=true; solidMesh.receiveShadow=true; scene.add(solidMesh);
+  const glowMesh=buildMesh(GLOW,boxGeo,glowMat); glowMesh.castShadow=true; scene.add(glowMesh);
+  const wGeo=new THREE.PlaneGeometry(1,1).rotateX(-Math.PI/2).translate(0,0.3,0);
+  waterMesh=buildMesh(WATER,wGeo,waterMat); waterMesh.receiveShadow=true; waterMesh.renderOrder=2; scene.add(waterMesh);
+  fallsMesh=buildMesh(FALLS,boxGeo,fallsMat); fallsMesh.receiveShadow=true; scene.add(fallsMesh);
+  cloudMesh=buildMesh(CLOUD,boxGeo,cloudMat,{occ:CLOUD}); scene.add(cloudMesh);
+  scene.add(buildMesh(MIST,boxGeo,cloudMat));
+
+  // small flora (flowers, reeds, tufts, pebbles)
+  const floraMesh=new THREE.InstancedMesh(boxGeo,solidMat,Math.max(1,FLORA.length)); floraMesh.count=FLORA.length;
+  FLORA.forEach((f,i)=>{ const w=f.w??0.45, h=f.h??0.45, b=f.b??0;
+    dummy.position.set(f.x,f.y-0.5+b+h/2,f.z); dummy.rotation.set(0,rand()*1.5,0); dummy.scale.set(w,h,w); dummy.updateMatrix();
+    floraMesh.setMatrixAt(i,dummy.matrix); col.setHex(jit(f.c,0.05)); floraMesh.setColorAt(i,col); });
+  floraMesh.receiveShadow=true; floraMesh.castShadow=true; floraMesh.frustumCulled=false; scene.add(floraMesh);
+
+  // point lights for lanterns (night)
+  LIGHTS.slice(0,12).forEach(L=>{ const p=new THREE.PointLight(L.c,0,24,2); p.position.set(L.x,L.y,L.z); scene.add(p); plights.push(p); });
+
+  // koi
+  const KOI_N=9, PAT=[[0xff7b1c,0xff7b1c,0xffffff,0xff7b1c,0xffffff],[0xffffff,0xe63222,0xffffff,0xe63222,0xffffff],
+    [0xffc531,0xffc531,0xffd75e,0xffc531,0xffe08a],[0x1d1d1d,0xffffff,0xe63222,0x1d1d1d,0xffffff],[0xff9a3c,0xffb36b,0xff9a3c,0xffffff,0xff9a3c]];
+  koiMesh=new THREE.InstancedMesh(boxGeo,new THREE.MeshStandardMaterial({roughness:0.45}),KOI_N*5); koiMesh.frustumCulled=false;
+  for(let i=0;i<KOI_N;i++){ kois.push({cx:-10+rr(-3,3),cz:17+rr(-1,1),r1:rr(4,10),r2:rr(1.8,3.8),sp:rr(0.15,0.35)*(rand()<0.5?1:-1),ph:rand()*6.28,wob:rr(0,6)});
+    const pat=pick(PAT); for(let j=0;j<5;j++){ col.setHex(pat[j]); koiMesh.setColorAt(i*5+j,col); } }
+  scene.add(koiMesh);
+
+  // petals
+  const PET_N=900;
+  petalMesh=new THREE.InstancedMesh(new THREE.BoxGeometry(0.42,0.07,0.42),new THREE.MeshStandardMaterial({roughness:0.55}),PET_N); petalMesh.frustumCulled=false;
+  for(let i=0;i<PET_N;i++){ const p={}; spawnPetal(p,true); petals.push(p); col.setHex(pick([...PINK_L,...PINK_D])); petalMesh.setColorAt(i,col); }
+  scene.add(petalMesh);
+
+  // fireflies
+  const FF_N=160; ffMat=new THREE.MeshBasicMaterial({color:0x000000});
+  ffMesh=new THREE.InstancedMesh(new THREE.BoxGeometry(0.2,0.2,0.2),ffMat,FF_N); ffMesh.frustumCulled=false;
+  for(let i=0,tries=0;i<FF_N&&tries<5000;tries++){ const x=ri(-38,38), z=ri(-38,38); const g=gY(x,z); if(g==null) continue;
+    ffs.push({x,y:Math.max(g,-1)+rr(1,6),z,a:rr(0.2,0.6),b:rr(0.3,0.8),c:rr(0.2,0.6),ph:rr(0,6.28)}); i++; }
+  ffMesh.count=ffs.length; scene.add(ffMesh);
+
+  // stars, sun, moon
+  const sp=new Float32Array(2000*3);
+  for(let i=0;i<2000;i++){ const u=rand()*2-1, a=rand()*Math.PI*2, s=Math.sqrt(1-u*u); sp[i*3]=Math.cos(a)*s*900; sp[i*3+1]=u*900; sp[i*3+2]=Math.sin(a)*s*900; }
+  const sg=new THREE.BufferGeometry(); sg.setAttribute('position',new THREE.BufferAttribute(sp,3));
+  starMat=new THREE.PointsMaterial({color:0xffffff,size:1.8,sizeAttenuation:false,transparent:true,opacity:0,fog:false,depthWrite:false});
+  scene.add(new THREE.Points(sg,starMat));
+  sunMesh=new THREE.Mesh(new THREE.BoxGeometry(26,26,26),new THREE.MeshBasicMaterial({color:new THREE.Color(6,5,3.6),fog:false}));
+  sunMesh.position.copy(SUN_DIR).multiplyScalar(700); scene.add(sunMesh);
+  moonMesh=new THREE.Mesh(new THREE.BoxGeometry(18,18,18),new THREE.MeshBasicMaterial({color:new THREE.Color(1.8,1.9,2.4),fog:false}));
+  moonMesh.position.copy(MOON_DIR).multiplyScalar(700); scene.add(moonMesh);
+
+  // cranes
+  for(let i=0;i<4;i++){ const c=makeCrane(); Object.assign(c,{R:rr(55,80),h:rr(40,62),sp:rr(0.08,0.12)*(i%2?1:-1),ph:rand()*6.28}); cranes.push(c); }
+}
+
+/* ======================= DAY / NIGHT ======================= */
+function applyNight(n){
+  const L=THREE.MathUtils.lerp;
+  const top=DAY_TOP.clone().lerp(NIGHT_TOP,n), mid=DAY_MID.clone().lerp(NIGHT_MID,n), bot=DAY_BOT.clone().lerp(NIGHT_BOT,n);
+  const gr=bgCtx.createLinearGradient(0,0,0,512);
+  gr.addColorStop(0,'#'+top.getHexString()); gr.addColorStop(0.6,'#'+mid.getHexString()); gr.addColorStop(1,'#'+bot.getHexString());
+  bgCtx.fillStyle=gr; bgCtx.fillRect(0,0,4,512); bgTex.needsUpdate=true;
+  scene.fog.color.copy(mid).lerp(bot,0.4);
+  const dir=SUN_DIR.clone().lerp(MOON_DIR,n).normalize();
+  sun.position.copy(dir).multiplyScalar(220).add(sun.target.position);
+  sun.intensity=L(3.2,0.6,n); sun.color.copy(SUN_C).lerp(MOON_C,n);
+  hemi.intensity=L(1.15,0.4,n); hemi.color.copy(HEMI_SKY_D).lerp(HEMI_SKY_N,n); hemi.groundColor.copy(HEMI_GR_D).lerp(HEMI_GR_N,n);
+  fill.intensity=L(0.35,0.1,n);
+  glowMat.color.setScalar(L(1.35,4.5,n));
+  cloudMat.emissiveIntensity=L(0.25,0.03,n);
+  bloom.strength=L(0.25,1.2,n); bloom.threshold=L(1.05,0.6,n); bloom.radius=L(0.5,0.75,n);
+  renderer.toneMappingExposure=L(1.05,1.3,n);
+  plights.forEach(p=>p.intensity=L(0,40,n));
+  starMat.opacity=Math.max(0,(n-0.3)/0.7);
+  sunMesh.visible=n<0.5; moonMesh.visible=n>=0.5;
+  ffMat.color.setRGB(3.5*n,3.0*n,0.9*n); ffMesh.visible=n>0.03;
+  renderer.shadowMap.needsUpdate=true;
+}
+
+/* ======================= ANIMATION LOOP ======================= */
+const WHITE=new THREE.Color(1,1,1);
+function animate(){
+  requestAnimationFrame(animate);
+  const dt=Math.min(clock.getDelta(),0.05), t=clock.elapsedTime;
+  if(night!==nightTarget){ night+=(nightTarget-night)*Math.min(1,dt*1.6); if(Math.abs(nightTarget-night)<0.001) night=nightTarget; applyNight(night); }
+  controls.update();
+
+  // water shimmer
+  if(waterMesh.instanceColor){ const P=waterMesh.userData.pos, B=waterMesh.userData.base, fl=Math.floor(t*3);
+    for(let i=0;i<B.length;i++){ const x=P[i*3], z=P[i*3+2];
+      let s=0.92+0.12*Math.sin(x*0.7+t*1.6)*Math.sin(z*0.6-t*1.1);
+      const h=Math.sin(i*12.9898+fl*78.233)*43758.5453; if(h-Math.floor(h)>0.985) s=1.6;
+      col.copy(B[i]).multiplyScalar(s); waterMesh.setColorAt(i,col); }
+    waterMesh.instanceColor.needsUpdate=true; }
+  // flowing waterfalls
+  if(fallsMesh.instanceColor){ const P=fallsMesh.userData.pos, B=fallsMesh.userData.base;
+    for(let i=0;i<B.length;i++){ const x=P[i*3], y=P[i*3+1], z=P[i*3+2]; const v=y*0.35+t*2.2+x*0.37+z*0.61; const f=((v%1)+1)%1;
+      col.copy(B[i]).lerp(WHITE,f<0.28?0.7:0); fallsMesh.setColorAt(i,col); }
+    fallsMesh.instanceColor.needsUpdate=true; }
+  // koi
+  kois.forEach((k,i)=>{ for(let j=0;j<5;j++){
+    const a=k.ph+t*k.sp-j*(0.5/k.r1)*Math.sign(k.sp);
+    const x=k.cx+Math.cos(a)*k.r1, z=k.cz+Math.sin(a)*k.r2+Math.sin(a*3+k.wob)*0.6;
+    const sc=[0.62,0.68,0.6,0.5,0.75][j];
+    dummy.position.set(x,-1.95,z); dummy.rotation.set(0,-a+Math.sin(t*6+j)*0.2,0);
+    if(j===4) dummy.scale.set(sc,0.22,sc); else dummy.scale.set(sc,sc*0.7,sc);
+    dummy.updateMatrix(); koiMesh.setMatrixAt(i*5+j,dummy.matrix); } });
+  koiMesh.instanceMatrix.needsUpdate=true;
+  // petals
+  if(petalMesh.visible){ const wx=0.9*Math.cos(t*0.05), wz=0.6*Math.sin(t*0.07);
+    petals.forEach((p,i)=>{ p.x+=(wx+Math.sin(t*1.7+p.ph)*0.7)*dt; p.z+=(wz+Math.cos(t*1.3+p.ph)*0.7)*dt; p.y-=p.vy*dt;
+      p.rx+=p.sp*dt; p.rz+=p.sp*0.7*dt;
+      const g=HMAP.get(ck(R_(p.x),R_(p.z))); const floor=g==null? -80 : Math.max(g,-1.3)+0.55;
+      if(p.y<floor) spawnPetal(p,false);
+      dummy.position.set(p.x,p.y,p.z); dummy.rotation.set(p.rx,p.ph,p.rz); dummy.scale.set(1,1,1); dummy.updateMatrix(); petalMesh.setMatrixAt(i,dummy.matrix); });
+    petalMesh.instanceMatrix.needsUpdate=true; }
+  // fireflies
+  if(ffMesh.visible){ ffs.forEach((f,i)=>{ const s=0.4+0.8*Math.max(0,Math.sin(t*2+f.ph*3));
+      dummy.position.set(f.x+Math.sin(t*f.a+f.ph)*1.5, f.y+Math.sin(t*f.b+f.ph)*0.8, f.z+Math.cos(t*f.c+f.ph)*1.5);
+      dummy.rotation.set(0,0,0); dummy.scale.setScalar(s); dummy.updateMatrix(); ffMesh.setMatrixAt(i,dummy.matrix); });
+    ffMesh.instanceMatrix.needsUpdate=true; }
+  // cranes
+  cranes.forEach((c,i)=>{ const a=c.ph+t*c.sp, sg=Math.sign(c.sp);
+    c.g.position.set(Math.cos(a)*c.R, c.h+Math.sin(t*0.7+i)*2.5, Math.sin(a)*c.R);
+    c.g.rotation.set(0,Math.atan2(-Math.sin(a)*sg,Math.cos(a)*sg),0);
+    const f=Math.sin(t*3.2+i*1.7)*0.55; c.wl.rotation.z=f; c.wr.rotation.z=-f; });
+  cloudMesh.rotation.y=t*0.01;
+  sunMesh.rotation.y=moonMesh.rotation.y=t*0.1;
+  composer.render();
+}
+
+/* ======================= UI ======================= */
+const bNight=document.getElementById('bNight'), bRot=document.getElementById('bRot'), bPetal=document.getElementById('bPetal');
+bNight.onclick=()=>{ nightTarget=nightTarget?0:1; bNight.textContent=nightTarget?'☀️ Day':'🌙 Night'; };
+bRot.onclick=()=>{ controls.autoRotate=!controls.autoRotate; bRot.textContent=controls.autoRotate?'⏸ Rotate':'▶ Rotate'; };
+bPetal.onclick=()=>{ if(petalMesh) petalMesh.visible=!petalMesh.visible; };
+addEventListener('keydown',e=>{ const k=e.key.toLowerCase(); if(k==='n') bNight.click(); if(k==='r') bRot.click(); if(k==='p') bPetal.click(); });
+addEventListener('resize',()=>{ camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth,innerHeight); composer.setSize(innerWidth,innerHeight); });
+
+function init(){
+  generate();
+  buildScene();
+  applyNight(0);
+  document.getElementById('stats').textContent=`${SOLID.size.toLocaleString()} voxels · ${solidMesh.count.toLocaleString()} visible`;
+  const L=document.getElementById('loading'); L.style.opacity=0; setTimeout(()=>L.remove(),900);
+  clock.start(); animate();
+}
+setTimeout(init,60);
+</script>
+</body>
+</html>
